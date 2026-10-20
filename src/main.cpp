@@ -17,6 +17,9 @@ const char* WIFI_PASSWORD = "rolf_ben66";
 const char* API_URL =
     "http://192.168.1.120:3000/clients/arrival";
 
+// Basis-URL til client-endpoints.
+const char* API_BASE = "http://192.168.1.120:3000/clients";
+
 // Navnet identificerer denne RFID-læser i API'et.
 const char* CLIENT_NAME = "rfid_reader_2";
 
@@ -24,8 +27,8 @@ const char* CLIENT_NAME = "rfid_reader_2";
 const char* MQTT_SERVER = "192.168.1.120";
 const int MQTT_PORT = 1883;
 
-// Topic, hvor M5GO modtager alarmkommandoer.
-const char* MQTT_TOPIC = "office/alarm/rfid_reader_2";
+// Topic, hvor M5GO både sender og modtager alarm.
+const char* MQTT_TOPIC = "office/alarm/rfid_reader_1";
 
 // MQTT-klienten bruger Wi-Fi-forbindelsen.
 WiFiClient mqttWifiClient;
@@ -91,6 +94,15 @@ const unsigned long DEBOUNCE_TIME = 50;
 bool lastRawMagnetState = false;
 bool stableMagnetState = false;
 unsigned long lastMagnetChange = 0;
+
+// Hvor mange minutter døren må stå åben — hentes fra API.
+unsigned long doorOpenAlarmMinutes = 3;
+
+// Tidspunkt hvor døren blev åbnet (0 = ikke åben).
+unsigned long doorOpenSince = 0;
+
+// Har vi allerede sendt alarm for denne åbning?
+bool doorAlarmSent = false;
 
 // Konfiguration af de 10 RGB-LED'er.
 #define LED_PIN 15
@@ -439,6 +451,106 @@ void handleAlarm()
     }
 }
 
+// Henter door_open_alarm_minutes fra API'et via client_id.
+void loadDoorAlarmMinutes()
+{
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        Serial.println("Wi-Fi not connected - using default door alarm");
+        return;
+    }
+
+    WiFiClient client;
+    HTTPClient http;
+
+    http.setTimeout(5000);
+
+    // Trin 1: hent client_id ud fra CLIENT_NAME.
+    String idUrl = String(API_BASE) +
+                   "/get_client_id/" +
+                   CLIENT_NAME;
+
+    if (!http.begin(client, idUrl))
+    {
+        Serial.println("Could not reach get_client_id");
+        return;
+    }
+
+    int code = http.GET();
+
+    if (code != 200)
+    {
+        Serial.print("get_client_id failed: ");
+        Serial.println(code);
+        http.end();
+        return;
+    }
+
+    String body = http.getString();
+    http.end();
+
+    StaticJsonDocument<128> idDoc;
+
+    if (deserializeJson(idDoc, body))
+    {
+        Serial.println("get_client_id JSON error");
+        return;
+    }
+
+    int clientId = idDoc["client_id"] | 0;
+
+    if (clientId <= 0)
+    {
+        Serial.println("Invalid client_id");
+        return;
+    }
+
+    // Trin 2: hent settings for client_id.
+    String settingsUrl = String(API_BASE) +
+                         "/settings/" +
+                         String(clientId);
+
+    if (!http.begin(client, settingsUrl))
+    {
+        Serial.println("Could not reach settings");
+        return;
+    }
+
+    code = http.GET();
+
+    if (code != 200)
+    {
+        Serial.print("settings failed: ");
+        Serial.println(code);
+        http.end();
+        return;
+    }
+
+    body = http.getString();
+    http.end();
+
+    // API returnerer et array med ét element.
+    StaticJsonDocument<512> arr;
+
+    if (deserializeJson(arr, body))
+    {
+        Serial.println("settings JSON error");
+        return;
+    }
+
+    JsonObject settings = arr[0];
+
+    int minutes = settings["door_open_alarm_minutes"] | 3;
+
+    if (minutes >= 1 && minutes <= 60)
+    {
+        doorOpenAlarmMinutes = (unsigned long)minutes;
+    }
+
+    Serial.print("Door alarm minutes: ");
+    Serial.println(doorOpenAlarmMinutes);
+}
+
 // Kontrollerer RFID-kortet via den eksisterende API.
 void checkCard(String uid)
 {
@@ -529,7 +641,8 @@ void checkCard(String uid)
             responseDoc["last_name"] | "";
 
         accessMessage = "Welcome " +
-                        firstName + " " + lastName;
+                        firstName + " " +
+                        lastName;
 
         // Et godkendt kort ophæver en eventuel aktiv alarm,
         // så skærmen går tilbage til velkomstvisning.
@@ -545,6 +658,9 @@ void checkCard(String uid)
         {
             doorUnlocked = true;
             unlockTime = millis();
+
+            // Ny åbning = ny alarm-cyklus.
+            doorAlarmSent = false;
         }
         else
         {
@@ -614,6 +730,10 @@ void handleDoor()
                     doorOpen = true;
                     accessMessage = "DOOR OPEN";
 
+                    // Start timer til dør-alarm.
+                    doorOpenSince = millis();
+                    doorAlarmSent = false;
+
                     Serial.println("DOOR OPENED");
                 }
                 else
@@ -622,6 +742,10 @@ void handleDoor()
                     doorOpen = false;
                     doorUnlocked = false;
                     accessExpired = false;
+
+                    // Stop timer til dør-alarm.
+                    doorOpenSince = 0;
+                    doorAlarmSent = false;
 
                     accessMessage = "DOOR CLOSED";
 
@@ -656,6 +780,38 @@ void handleDoor()
         setRed();
 
         showMessage();
+    }
+
+    // Tjek om døren har stået åben for længe.
+    if (doorOpen && doorOpenSince > 0 && !doorAlarmSent)
+    {
+        unsigned long openMs = millis() - doorOpenSince;
+        unsigned long limitMs =
+            doorOpenAlarmMinutes * 60UL * 1000UL;
+
+        if (openMs >= limitMs)
+        {
+            doorAlarmSent = true;
+
+            Serial.println(
+                "Door open too long - publishing ALARM"
+            );
+
+            if (mqttClient.connected())
+            {
+                mqttClient.publish(
+                    MQTT_TOPIC,
+                    "ALARM",
+                    false
+                );
+            }
+            else
+            {
+                Serial.println(
+                    "MQTT not connected - alarm not sent"
+                );
+            }
+        }
     }
 }
 
@@ -717,6 +873,9 @@ void setup()
     mqttClient.setSocketTimeout(2);
 
     connectMQTT();
+
+    // Hent grænsen for hvor længe døren må stå åben.
+    loadDoorAlarmMinutes();
 
     Serial.println("RFID access control started");
     Serial.println("MQTT alarm receiver started");
@@ -803,7 +962,7 @@ void loop()
         Serial.print("RFID UID: ");
         Serial.println(lastUID);
 
-        // Kontrollér kortet via API'et.
+        // Kontroller kortet via API'et.
         checkCard(lastUID);
 
         // Afslut læsningen, så kortet kan læses igen senere.
