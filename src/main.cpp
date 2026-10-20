@@ -21,7 +21,7 @@ const char* API_URL =
 const char* API_BASE = "http://192.168.1.120:3000/clients";
 
 // Navnet identificerer denne RFID-læser i API'et.
-const char* CLIENT_NAME = "rfid_reader_2";
+const char* CLIENT_NAME = "rfid_reader_1";
 
 // MQTT-brokerens IP-adresse og port.
 const char* MQTT_SERVER = "192.168.1.120";
@@ -201,7 +201,7 @@ void showMessage()
 
     M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
 
-    M5.Display.println("OFFICE");
+    M5.Display.println("DATACENTER");
     M5.Display.println("----------------");
 
     M5.Display.print("UID: ");
