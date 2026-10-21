@@ -59,6 +59,15 @@ bool sensorAvailable = false;
 float temperature = 0.0;
 float humidity = 0.0;
 
+// Grænser hentet fra API'et.
+float temperatureLow = 18.0;
+float temperatureHigh = 21.0;
+float humidityLow = 30.0;
+float humidityHigh = 50.0;
+
+// Måleinterval i minutter hentet fra API'et.
+unsigned long databaseIntervalMinutes = 10;
+
 // Gemmer tidspunktet for seneste sensoropdatering.
 unsigned long lastSensorUpdate = 0;
 
@@ -104,6 +113,13 @@ unsigned long doorOpenSince = 0;
 // Har vi allerede sendt alarm for denne åbning?
 bool doorAlarmSent = false;
 
+// Viser grøn LED midlertidigt efter godkendt adgang.
+bool accessFeedbackActive = false;
+unsigned long accessFeedbackStart = 0;
+
+// Hvor længe grøn vises efter godkendt adgang (ms).
+const unsigned long ACCESS_FEEDBACK_MS = 3000;
+
 // Konfiguration af de 10 RGB-LED'er.
 #define LED_PIN 15
 #define NUM_LEDS 10
@@ -117,8 +133,6 @@ Adafruit_NeoPixel leds(
 // Tænder alle LED'er grønne.
 void setGreen()
 {
-    // Grøn vises altid ved godkendt adgang — også selvom alarmen
-    // lige har været aktiv, så skærmen ikke hænger på alarmvisning.
     for (int i = 0; i < NUM_LEDS; i++)
     {
         leds.setPixelColor(i, leds.Color(0, 255, 0));
@@ -151,11 +165,80 @@ void setOff()
     leds.show();
 }
 
+// Returnerer "OK", "LOW" eller "HIGH" for en værdi.
+String classifyValue(float value, float low, float high)
+{
+    if (value < low)
+    {
+        return "LOW";
+    }
+
+    if (value > high)
+    {
+        return "HIGH";
+    }
+
+    return "OK";
+}
+
+// Tjekker om både temperatur og luftfugtighed er inden for grænserne.
+bool valuesAreWithinLimits()
+{
+    // Hvis sensoren ikke findes, kan vi ikke vurdere noget — vis grøn.
+    if (!sensorAvailable)
+    {
+        return true;
+    }
+
+    return temperature >= temperatureLow &&
+           temperature <= temperatureHigh &&
+           humidity >= humidityLow &&
+           humidity <= humidityHigh;
+}
+
+// Viser grøn LED i et par sekunder efter godkendt adgang.
+void showAccessGrantedFeedback()
+{
+    accessFeedbackActive = true;
+    accessFeedbackStart = millis();
+
+    setGreen();
+}
+
+// Opdaterer LED-farven ud fra om værdierne er inden for grænserne.
+void updateLedFromValues()
+{
+    if (alarmActive)
+    {
+        setRed();
+        return;
+    }
+
+    // Grøn adgangsfeedback har prioritet i et par sekunder.
+    if (accessFeedbackActive)
+    {
+        if (millis() - accessFeedbackStart < ACCESS_FEEDBACK_MS)
+        {
+            setGreen();
+            return;
+        }
+
+        accessFeedbackActive = false;
+    }
+
+    if (valuesAreWithinLimits())
+    {
+        setGreen();
+    }
+    else
+    {
+        setRed();
+    }
+}
+
 // Afspiller lyd, når et RFID-kort godkendes.
 void playAccessGrantedSound()
 {
-    // Godkendelseslyden skal altid afspilles, så brugeren får
-    // bekræftelse på at kortet blev læst korrekt.
     M5.Speaker.setVolume(50);
     M5.Speaker.tone(1200, 150);
     delay(180);
@@ -165,7 +248,6 @@ void playAccessGrantedSound()
 // Afspiller lyd, når et RFID-kort afvises.
 void playAccessDeniedSound()
 {
-    // Sikkerhedsalarmen har prioritet over RFID-lyde.
     if (alarmActive)
     {
         return;
@@ -184,7 +266,7 @@ void showMessage()
     M5.Display.setCursor(10, 10);
     M5.Display.setTextSize(2);
 
-    // Under alarm vises KUN alarmteksten, så der er plads på skærmen.
+    // Under alarm vises KUN alarmteksten.
     if (alarmActive)
     {
         M5.Display.fillScreen(TFT_RED);
@@ -253,29 +335,41 @@ void showMessage()
 
     M5.Display.println();
 
-    // Vis temperatur og luftfugtighed, hvis sensoren findes.
+    // Vis temperatur og luftfugtighed med OK/LOW/HIGH.
     if (sensorAvailable)
     {
+        String tempState = classifyValue(
+            temperature,
+            temperatureLow,
+            temperatureHigh
+        );
+
+        String humState = classifyValue(
+            humidity,
+            humidityLow,
+            humidityHigh
+        );
+
         M5.Display.print("Temp: ");
         M5.Display.print(temperature, 1);
-        M5.Display.println(" C");
+        M5.Display.print(" C ");
+        M5.Display.println(tempState);
 
-        M5.Display.print("Humidity: ");
+        M5.Display.print("Hum:  ");
         M5.Display.print(humidity, 1);
-        M5.Display.println(" %");
+        M5.Display.print(" % ");
+        M5.Display.println(humState);
     }
     else
     {
         M5.Display.println("ENV III not found");
     }
 
-    // Vis, hvis Wi-Fi ikke er forbundet.
     if (WiFi.status() != WL_CONNECTED)
     {
         M5.Display.println("Wi-Fi disconnected");
     }
 
-    // Vis, hvis MQTT-forbindelsen mangler.
     if (!mqttClient.connected())
     {
         M5.Display.println("MQTT disconnected");
@@ -292,7 +386,6 @@ void connectWiFi()
 
     unsigned long startTime = millis();
 
-    // Vent højst 15 sekunder på Wi-Fi.
     while (WiFi.status() != WL_CONNECTED &&
            millis() - startTime < 15000)
     {
@@ -320,13 +413,11 @@ void mqttCallback(
     unsigned int length
 )
 {
-    // Ignorer beskeder fra andre topics.
     if (String(topic) != MQTT_TOPIC)
     {
         return;
     }
 
-    // Konverter MQTT-payload til en tekststreng.
     String message = "";
 
     for (unsigned int i = 0; i < length; i++)
@@ -339,12 +430,10 @@ void mqttCallback(
     Serial.print("MQTT message received: ");
     Serial.println(message);
 
-    // ALARM aktiverer rød belysning og op til 4 bip.
     if (message == "ALARM")
     {
         alarmActive = true;
 
-        // Nulstil tælleren, så alarmen starter forfra.
         alarmBeepCount = 0;
         lastAlarmSound = 0;
 
@@ -355,19 +444,17 @@ void mqttCallback(
 
         Serial.println("SECURITY ALARM ACTIVATED");
     }
-
-    // CLEAR stopper alarmen og slukker LED'erne.
     else if (message == "CLEAR")
     {
         alarmActive = false;
-
-        // Nulstil bip-tælleren, så næste alarm starter forfra.
         alarmBeepCount = 0;
 
         M5.Speaker.stop();
-        setOff();
 
         accessMessage = "Scan your card";
+
+        // LED skal nu afspejle sensordata, ikke alarmen.
+        updateLedFromValues();
         showMessage();
 
         Serial.println("SECURITY ALARM CLEARED");
@@ -377,34 +464,27 @@ void mqttCallback(
 // Forsøger at forbinde til MQTT-brokeren.
 void connectMQTT()
 {
-    // MQTT kræver en aktiv Wi-Fi-forbindelse.
     if (WiFi.status() != WL_CONNECTED)
     {
         return;
     }
 
-    // Undgå at oprette forbindelse igen, hvis den allerede findes.
     if (mqttClient.connected())
     {
         return;
     }
 
-    // Angiv MQTT-server og funktionen til indgående beskeder.
     mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
     mqttClient.setCallback(mqttCallback);
 
-    // Klient-ID skal være unikt for denne M5GO.
     String clientId = "m5go_" + String(CLIENT_NAME);
 
     Serial.println("Connecting to MQTT...");
 
-    // Forbind til brokeren uden brugernavn og adgangskode.
-    // Hvis din broker kræver login, skal dette ændres.
     if (mqttClient.connect(clientId.c_str()))
     {
         Serial.println("MQTT connected");
 
-        // Abonnér på alarmbeskeder.
         if (mqttClient.subscribe(MQTT_TOPIC))
         {
             Serial.println("Subscribed to alarm topic");
@@ -421,8 +501,7 @@ void connectMQTT()
     }
 }
 
-// Holder alarmen aktiv, indtil CLEAR modtages,
-// men afspiller kun et begrænset antal bip.
+// Holder alarmen aktiv, indtil CLEAR modtages.
 void handleAlarm()
 {
     if (!alarmActive)
@@ -430,10 +509,8 @@ void handleAlarm()
         return;
     }
 
-    // Gendan rød farve, hvis andre funktioner har ændret LED'erne.
     setRed();
 
-    // Afspil kun bip, indtil det maksimale antal er nået.
     if (alarmBeepCount < ALARM_MAX_BEEPS &&
         millis() - lastAlarmSound >= ALARM_SOUND_INTERVAL)
     {
@@ -451,13 +528,13 @@ void handleAlarm()
     }
 }
 
-// Henter door_open_alarm_minutes fra API'et via client_id.
-void loadDoorAlarmMinutes()
+// Henter client_id for denne enhed fra API'et.
+int fetchClientId()
 {
     if (WiFi.status() != WL_CONNECTED)
     {
-        Serial.println("Wi-Fi not connected - using default door alarm");
-        return;
+        Serial.println("Wi-Fi not connected - cannot fetch client_id");
+        return -1;
     }
 
     WiFiClient client;
@@ -465,7 +542,6 @@ void loadDoorAlarmMinutes()
 
     http.setTimeout(5000);
 
-    // Trin 1: hent client_id ud fra CLIENT_NAME.
     String idUrl = String(API_BASE) +
                    "/get_client_id/" +
                    CLIENT_NAME;
@@ -473,7 +549,7 @@ void loadDoorAlarmMinutes()
     if (!http.begin(client, idUrl))
     {
         Serial.println("Could not reach get_client_id");
-        return;
+        return -1;
     }
 
     int code = http.GET();
@@ -483,7 +559,7 @@ void loadDoorAlarmMinutes()
         Serial.print("get_client_id failed: ");
         Serial.println(code);
         http.end();
-        return;
+        return -1;
     }
 
     String body = http.getString();
@@ -494,7 +570,7 @@ void loadDoorAlarmMinutes()
     if (deserializeJson(idDoc, body))
     {
         Serial.println("get_client_id JSON error");
-        return;
+        return -1;
     }
 
     int clientId = idDoc["client_id"] | 0;
@@ -502,10 +578,27 @@ void loadDoorAlarmMinutes()
     if (clientId <= 0)
     {
         Serial.println("Invalid client_id");
+        return -1;
+    }
+
+    return clientId;
+}
+
+// Henter alle sensor-settings og opdaterer de globale variabler.
+void loadSensorSettings()
+{
+    int clientId = fetchClientId();
+
+    if (clientId <= 0)
+    {
         return;
     }
 
-    // Trin 2: hent settings for client_id.
+    WiFiClient client;
+    HTTPClient http;
+
+    http.setTimeout(5000);
+
     String settingsUrl = String(API_BASE) +
                          "/settings/" +
                          String(clientId);
@@ -516,7 +609,7 @@ void loadDoorAlarmMinutes()
         return;
     }
 
-    code = http.GET();
+    int code = http.GET();
 
     if (code != 200)
     {
@@ -526,10 +619,9 @@ void loadDoorAlarmMinutes()
         return;
     }
 
-    body = http.getString();
+    String body = http.getString();
     http.end();
 
-    // API returnerer et array med ét element.
     StaticJsonDocument<512> arr;
 
     if (deserializeJson(arr, body))
@@ -540,18 +632,57 @@ void loadDoorAlarmMinutes()
 
     JsonObject settings = arr[0];
 
-    int minutes = settings["door_open_alarm_minutes"] | 3;
+    // Cast eksplicit til float, fordi API'et returnerer strenge.
+    temperatureLow = settings["temperature_low"].as<float>();
+    temperatureHigh = settings["temperature_high"].as<float>();
+    humidityLow = settings["humidity_low"].as<float>();
+    humidityHigh = settings["humidity_high"].as<float>();
 
-    if (minutes >= 1 && minutes <= 60)
+    // Fallback hvis feltet mangler eller er 0.
+    if (temperatureLow == 0.0f && temperatureHigh == 0.0f)
     {
-        doorOpenAlarmMinutes = (unsigned long)minutes;
+        temperatureLow = 18.0;
+        temperatureHigh = 21.0;
     }
 
-    Serial.print("Door alarm minutes: ");
+    if (humidityLow == 0.0f && humidityHigh == 0.0f)
+    {
+        humidityLow = 30.0;
+        humidityHigh = 50.0;
+    }
+
+    // Måleinterval i minutter.
+    int interval = settings["database_interval"] | 10;
+
+    if (interval >= 1 && interval <= 1440)
+    {
+        databaseIntervalMinutes = (unsigned long)interval;
+    }
+
+    // Dør-alarm-grænse.
+    int doorMinutes = settings["door_open_alarm_minutes"] | 3;
+
+    if (doorMinutes >= 1 && doorMinutes <= 60)
+    {
+        doorOpenAlarmMinutes = (unsigned long)doorMinutes;
+    }
+
+    Serial.println("Settings loaded:");
+    Serial.print("  temperature_low:   ");
+    Serial.println(temperatureLow);
+    Serial.print("  temperature_high:  ");
+    Serial.println(temperatureHigh);
+    Serial.print("  humidity_low:      ");
+    Serial.println(humidityLow);
+    Serial.print("  humidity_high:     ");
+    Serial.println(humidityHigh);
+    Serial.print("  database_interval: ");
+    Serial.println(databaseIntervalMinutes);
+    Serial.print("  door_alarm_min:    ");
     Serial.println(doorOpenAlarmMinutes);
 }
 
-// Kontrollerer RFID-kortet via den eksisterende API.
+// Kontrollerer RFID-kortet via API.
 void checkCard(String uid)
 {
     accessChecked = true;
@@ -644,8 +775,6 @@ void checkCard(String uid)
                         firstName + " " +
                         lastName;
 
-        // Et godkendt kort ophæver en eventuel aktiv alarm,
-        // så skærmen går tilbage til velkomstvisning.
         if (alarmActive)
         {
             alarmActive = false;
@@ -653,13 +782,10 @@ void checkCard(String uid)
             M5.Speaker.stop();
         }
 
-        // Lås kun døren op, hvis den ikke allerede er åben.
         if (!doorOpen)
         {
             doorUnlocked = true;
             unlockTime = millis();
-
-            // Ny åbning = ny alarm-cyklus.
             doorAlarmSent = false;
         }
         else
@@ -667,7 +793,8 @@ void checkCard(String uid)
             Serial.println("Door is already open");
         }
 
-        setGreen();
+        // Vis grøn feedback i et par sekunder.
+        showAccessGrantedFeedback();
         playAccessGrantedSound();
 
         Serial.println(accessMessage);
@@ -676,7 +803,6 @@ void checkCard(String uid)
     }
     else
     {
-        // Brug fejlbeskeden fra API'et, hvis den findes.
         String errorMessage =
             responseDoc["error_message"] | "Access denied";
 
@@ -697,25 +823,21 @@ void checkCard(String uid)
 // Læser magnetkontakten og håndterer dørens tilstand.
 void handleDoor()
 {
-    // Læs det aktuelle signal fra magnetkontakten.
     bool rawMagnetState =
         digitalRead(MAGNET_PIN) == MAGNET_ACTIVE;
 
-    // Registrer, hvornår signalet ændres.
     if (rawMagnetState != lastRawMagnetState)
     {
         lastRawMagnetState = rawMagnetState;
         lastMagnetChange = millis();
     }
 
-    // Accepter kun et signal, der er stabilt længe nok.
     if (millis() - lastMagnetChange >= DEBOUNCE_TIME)
     {
         if (stableMagnetState != rawMagnetState)
         {
             stableMagnetState = rawMagnetState;
 
-            // Reager på overgangen til aktiv tilstand.
             if (stableMagnetState)
             {
                 if (!doorUnlocked)
@@ -726,11 +848,9 @@ void handleDoor()
 
                 if (!doorOpen)
                 {
-                    // Første aktivering åbner døren.
                     doorOpen = true;
                     accessMessage = "DOOR OPEN";
 
-                    // Start timer til dør-alarm.
                     doorOpenSince = millis();
                     doorAlarmSent = false;
 
@@ -738,24 +858,21 @@ void handleDoor()
                 }
                 else
                 {
-                    // Næste aktivering lukker og låser døren.
                     doorOpen = false;
                     doorUnlocked = false;
                     accessExpired = false;
 
-                    // Stop timer til dør-alarm.
                     doorOpenSince = 0;
                     doorAlarmSent = false;
 
                     accessMessage = "DOOR CLOSED";
 
-                    setOff();
+                    updateLedFromValues();
 
                     Serial.println("DOOR CLOSED");
                     Serial.println("Door is now locked");
                 }
 
-                // Vis ikke den normale dørstatus i stedet for alarmen.
                 if (alarmActive)
                 {
                     accessMessage = "SECURITY ALARM";
@@ -767,8 +884,6 @@ void handleDoor()
         }
     }
 
-    // Lås automatisk døren, hvis den ikke åbnes i tide.
-    // En åben dør lukkes ikke automatisk af denne kode.
     if (doorUnlocked &&
         !doorOpen &&
         millis() - unlockTime >= UNLOCK_TIMEOUT)
@@ -777,12 +892,11 @@ void handleDoor()
         accessExpired = true;
         accessMessage = "";
 
-        setRed();
+        updateLedFromValues();
 
         showMessage();
     }
 
-    // Tjek om døren har stået åben for længe.
     if (doorOpen && doorOpenSince > 0 && !doorAlarmSent)
     {
         unsigned long openMs = millis() - doorOpenSince;
@@ -815,6 +929,33 @@ void handleDoor()
     }
 }
 
+// Læser sensoren og opdaterer display og LED.
+void updateSensor()
+{
+    if (!sensorAvailable)
+    {
+        return;
+    }
+
+    if (!sht3x.update())
+    {
+        Serial.println("Sensor update failed");
+        return;
+    }
+
+    temperature = sht3x.cTemp;
+    humidity = sht3x.humidity;
+
+    Serial.print("Temperature: ");
+    Serial.println(temperature);
+
+    Serial.print("Humidity: ");
+    Serial.println(humidity);
+
+    updateLedFromValues();
+    showMessage();
+}
+
 // Initialiserer M5GO, sensorer, Wi-Fi og MQTT.
 void setup()
 {
@@ -823,14 +964,12 @@ void setup()
 
     Serial.begin(115200);
 
-    // Initialiser LED-strippen.
     pinMode(LED_PIN, OUTPUT_OPEN_DRAIN);
 
     leds.begin();
     leds.setBrightness(60);
     setOff();
 
-    // Initialiser magnetkontakten på Grove Port B.
     pinMode(MAGNET_PIN, INPUT);
 
     lastRawMagnetState =
@@ -841,13 +980,10 @@ void setup()
 
     Serial.println("Magnet contact started");
 
-    // RFID og ENV III deler I2C-bussen.
     Wire.begin(21, 22);
 
-    // Initialiser RFID-læseren.
     rfid.PCD_Init();
 
-    // Forsøg at finde ENV III-sensoren.
     if (sht3x.begin(
             &Wire,
             SHT3X_I2C_ADDR,
@@ -863,10 +999,8 @@ void setup()
         Serial.println("ENV III not found");
     }
 
-    // Opret forbindelse til Wi-Fi.
     connectWiFi();
 
-    // Konfigurer MQTT og forsøg at oprette forbindelse.
     mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
     mqttClient.setCallback(mqttCallback);
     mqttClient.setKeepAlive(30);
@@ -874,8 +1008,12 @@ void setup()
 
     connectMQTT();
 
-    // Hent grænsen for hvor længe døren må stå åben.
-    loadDoorAlarmMinutes();
+    // Hent alle grænser og måleinterval fra API.
+    loadSensorSettings();
+
+    // Tag den første måling med det samme.
+    updateSensor();
+    lastSensorUpdate = millis();
 
     Serial.println("RFID access control started");
     Serial.println("MQTT alarm receiver started");
@@ -887,11 +1025,8 @@ void setup()
 // Hovedloopet holder MQTT, sensorer, RFID og dørfunktioner kørende.
 void loop()
 {
-    // Opdater M5GO's interne funktioner.
     M5.update();
 
-    // Genopret MQTT-forbindelsen, hvis den er faldet ud.
-    // Forbindelsesforsøg foretages med mellemrum nedenfor.
     static unsigned long lastMqttAttempt = 0;
 
     if (WiFi.status() == WL_CONNECTED &&
@@ -902,45 +1037,38 @@ void loop()
         connectMQTT();
     }
 
-    // Behandl indgående MQTT-beskeder.
     if (mqttClient.connected())
     {
         mqttClient.loop();
     }
 
-    // Håndter lyd og rød LED, hvis alarmen er aktiv.
     handleAlarm();
 
-    // Håndter magnetkontakt og dør.
-    handleDoor();
-
-    // Opdater temperatur og luftfugtighed hvert minut.
-    if (millis() - lastSensorUpdate >= 60000)
+    // Falder tilbage til sensorstatus når feedback er udløbet.
+    if (accessFeedbackActive &&
+        millis() - accessFeedbackStart >= ACCESS_FEEDBACK_MS)
     {
-        lastSensorUpdate = millis();
-
-        if (sensorAvailable && sht3x.update())
-        {
-            temperature = sht3x.cTemp;
-            humidity = sht3x.humidity;
-
-            Serial.print("Temperature: ");
-            Serial.println(temperature);
-
-            Serial.print("Humidity: ");
-            Serial.println(humidity);
-
-            showMessage();
-        }
+        accessFeedbackActive = false;
+        updateLedFromValues();
     }
 
-    // Kontroller, om et nyt RFID-kort er til stede.
+    handleDoor();
+
+    // Mål med det interval der er sat i settings.
+    unsigned long intervalMs =
+        databaseIntervalMinutes * 60UL * 1000UL;
+
+    if (millis() - lastSensorUpdate >= intervalMs)
+    {
+        lastSensorUpdate = millis();
+        updateSensor();
+    }
+
     if (rfid.PICC_IsNewCardPresent() &&
         rfid.PICC_ReadCardSerial())
     {
         String uid = "";
 
-        // Konverter kortets UID til en streng.
         for (byte i = 0; i < rfid.uid.size; i++)
         {
             if (rfid.uid.uidByte[i] < 0x10)
@@ -962,14 +1090,11 @@ void loop()
         Serial.print("RFID UID: ");
         Serial.println(lastUID);
 
-        // Kontroller kortet via API'et.
         checkCard(lastUID);
 
-        // Afslut læsningen, så kortet kan læses igen senere.
         rfid.PICC_HaltA();
         rfid.PCD_StopCrypto1();
     }
 
-    // Kort pause uden at blokere MQTT i længere tid.
     delay(20);
 }
