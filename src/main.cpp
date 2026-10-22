@@ -14,8 +14,7 @@ const char* WIFI_SSID = "ben_rolf_co_2.4GHz";
 const char* WIFI_PASSWORD = "rolf_ben66";
 
 // API-adressen til RFID-adgangskontrollen på Raspberry Pi.
-const char* API_URL =
-    "http://192.168.1.120:3000/clients/arrival";
+const char* API_URL ="http://192.168.1.120:3000/clients/arrival";
 
 // Basis-URL til client-endpoints.
 const char* API_BASE = "http://192.168.1.120:3000/clients";
@@ -83,7 +82,6 @@ bool accessExpired = false;
 const int MAGNET_PIN = 36;
 
 // LOW betyder, at magnetkontakten er aktiv.
-// Kontrollér dette mod din konkrete kontakttype.
 const int MAGNET_ACTIVE = LOW;
 
 // Holder styr på dørens låse- og åbenstatus.
